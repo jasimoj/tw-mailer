@@ -14,6 +14,7 @@
 #include <regex>
 #include <string>
 #include <vector>
+#include <thread>
 
 using namespace std;
 namespace fs = std::filesystem;
@@ -31,6 +32,12 @@ static bool checkDir(const fs::path &p)
     }
     // legt alle fehlenden Zwischenordner an
     return fs::create_directories(p, ec) || fs::is_directory(p);
+}
+
+static void handleClient(int c, string spool) {
+    // Hier werden die Befehle gelesen und gehandelt
+    shutdown(c, SHUT_RDWR);
+    close(c);
 }
 
 int main(int argc, char *argv[])
@@ -69,6 +76,9 @@ int main(int argc, char *argv[])
     socket_address.sin_family = AF_INET;         // ipv4
     socket_address.sin_addr.s_addr = INADDR_ANY; // server hört auf alle schnittstellen (0.0.0.0)
 
+    int yes = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    
     // bindet socket an port
     if (bind(s, (sockaddr *)&socket_address, sizeof(socket_address)) == -1)
     {
@@ -100,8 +110,8 @@ int main(int argc, char *argv[])
             perror("accept");
             continue;
         }
-        shutdown(c, SHUT_RDWR);
-        close(c);
+
+        thread{handleClient, c, spool}.detach(); //Thread läuft eigenständig im hintergrund weiter, blockiert server nicht
     }
     shutdown(s, SHUT_RDWR);
     close(s);
