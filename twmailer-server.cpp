@@ -15,12 +15,15 @@
 #include <string>
 #include <vector>
 #include <thread>
-
+#include <mutex>
 using namespace std;
 namespace fs = std::filesystem;
 
 static volatile sig_atomic_t g_abort = 0;
 static void on_sigint(int) { g_abort = 1; }
+
+std::mutex spoolMutex;
+std::mutex blacklistMutex;
 
 static bool checkDir(const fs::path &p)
 {
@@ -33,45 +36,57 @@ static bool checkDir(const fs::path &p)
 }
 
 // Read a line from socket
-string readLine(int sock) {
+string readLine(int sock)
+{
     string line;
     char c;
     ssize_t n;
-    while ((n = recv(sock, &c, 1, 0)) > 0) {
-        if (c == '\n') break;
-        if (c != '\r') line += c;
+    while ((n = recv(sock, &c, 1, 0)) > 0)
+    {
+        if (c == '\n')
+            break;
+        if (c != '\r')
+            line += c;
     }
     return line;
 }
 
 // Send a line to socket
-void sendLine(int sock, const string& line) {
+void sendLine(int sock, const string &line)
+{
     string msg = line + "\n";
     send(sock, msg.c_str(), msg.length(), 0);
 }
 
 // Validate username (max 8 chars, alphanumeric)
-bool isValidUsername(const string& username) {
-    if (username.empty() || username.length() > 8) return false;
+bool isValidUsername(const string &username)
+{
+    if (username.empty() || username.length() > 8)
+        return false;
     return regex_match(username, regex("^[a-z0-9]+$"));
 }
 
 // Get user inbox path
-fs::path getUserInbox(const string& spool, const string& username) {
+fs::path getUserInbox(const string &spool, const string &username)
+{
     return fs::path(spool) / username;
 }
 
 // Get all message files for a user
-vector<fs::path> getMessageFiles(const fs::path& inbox) {
+vector<fs::path> getMessageFiles(const fs::path &inbox)
+{
     vector<fs::path> files;
     error_code ec;
 
-    if (!fs::exists(inbox, ec) || !fs::is_directory(inbox, ec)) {
+    if (!fs::exists(inbox, ec) || !fs::is_directory(inbox, ec))
+    {
         return files;
     }
 
-    for (const auto& entry : fs::directory_iterator(inbox, ec)) {
-        if (entry.is_regular_file(ec)) {
+    for (const auto &entry : fs::directory_iterator(inbox, ec))
+    {
+        if (entry.is_regular_file(ec))
+        {
             files.push_back(entry.path());
         }
     }
@@ -81,17 +96,20 @@ vector<fs::path> getMessageFiles(const fs::path& inbox) {
 }
 
 // Handle SEND command
-void handleSend(int sock, const string& spool) {
+void handleSend(int sock, const string &spool)
+{
     string sender = readLine(sock);
     string receiver = readLine(sock);
     string subject = readLine(sock);
 
-    if (!isValidUsername(sender) || !isValidUsername(receiver)) {
+    if (!isValidUsername(sender) || !isValidUsername(receiver))
+    {
         sendLine(sock, "ERR");
         return;
     }
 
-    if (subject.length() > 80) {
+    if (subject.length() > 80)
+    {
         sendLine(sock, "ERR");
         return;
     }
@@ -99,64 +117,85 @@ void handleSend(int sock, const string& spool) {
     // Read message body until "."
     string message;
     string line;
-    while (true) {
+    while (true)
+    {
         line = readLine(sock);
-        if (line == ".") break;
+        if (line == ".")
+            break;
         message += line + "\n";
     }
+    {
+        // Lockguard damit threadsicher
+        std::lock_guard<std::mutex> lock(spoolMutex);
 
-    // Create receiver's inbox
-    fs::path inbox = getUserInbox(spool, receiver);
-    if (!checkDir(inbox)) {
-        sendLine(sock, "ERR");
-        return;
+        // Create receiver's inbox
+        fs::path inbox = getUserInbox(spool, receiver);
+        if (!checkDir(inbox))
+        {
+            sendLine(sock, "ERR");
+            return;
+        }
+
+        // Create unique filename (timestamp-based)
+        auto now = chrono::system_clock::now();
+        auto timestamp = chrono::duration_cast<chrono::milliseconds>(now.time_since_epoch()).count();
+        fs::path msgFile = inbox / (to_string(timestamp) + ".txt");
+
+        // Write message to file
+        ofstream out(msgFile);
+        if (!out)
+        {
+            sendLine(sock, "ERR");
+            return;
+        }
+
+        out << "Sender: " << sender << "\n";
+        out << "Receiver: " << receiver << "\n";
+        out << "Subject: " << subject << "\n";
+        out << "Message:\n"
+            << message;
+        out.close();
     }
-
-    // Create unique filename (timestamp-based)
-    auto now = chrono::system_clock::now();
-    auto timestamp = chrono::duration_cast<chrono::milliseconds>(now.time_since_epoch()).count();
-    fs::path msgFile = inbox / (to_string(timestamp) + ".txt");
-
-    // Write message to file
-    ofstream out(msgFile);
-    if (!out) {
-        sendLine(sock, "ERR");
-        return;
-    }
-
-    out << "Sender: " << sender << "\n";
-    out << "Receiver: " << receiver << "\n";
-    out << "Subject: " << subject << "\n";
-    out << "Message:\n" << message;
-    out.close();
-
     sendLine(sock, "OK");
 }
 
 // Handle LIST command
-void handleList(int sock, const string& spool) {
+void handleList(int sock, const string &spool)
+{
     string username = readLine(sock);
 
-    if (!isValidUsername(username)) {
+    if (!isValidUsername(username))
+    {
         sendLine(sock, "0");
         return;
     }
 
-    fs::path inbox = getUserInbox(spool, username);
-    vector<fs::path> files = getMessageFiles(inbox);
+    vector<fs::path> files;
+
+    {
+        // Lockguard damit threadsicher
+        std::lock_guard<std::mutex> lock(spoolMutex);
+
+        fs::path inbox = getUserInbox(spool, username);
+        files = getMessageFiles(inbox);
+    }
 
     sendLine(sock, to_string(files.size()));
 
-    for (const auto& file : files) {
+    for (const auto &file : files)
+    {
         ifstream in(file);
-        if (!in) continue;
+        if (!in)
+            continue;
 
         string line;
         string subject;
 
         // Read until we find the subject line
-        while (getline(in, line)) {
-            if (line.find("Subject: ") == 0) {
+        while (getline(in, line))
+        {
+            if (line.find("Subject: ") == 0)
+            {
                 subject = line.substr(9);
                 break;
             }
@@ -167,33 +206,45 @@ void handleList(int sock, const string& spool) {
 }
 
 // Handle READ command
-void handleRead(int sock, const string& spool) {
+void handleRead(int sock, const string &spool)
+{
     string username = readLine(sock);
     string msgNumStr = readLine(sock);
 
-    if (!isValidUsername(username)) {
+    if (!isValidUsername(username))
+    {
         sendLine(sock, "ERR");
         return;
     }
 
     int msgNum;
-    try {
+    try
+    {
         msgNum = stoi(msgNumStr);
-    } catch (...) {
+    }
+    catch (...)
+    {
         sendLine(sock, "ERR");
         return;
     }
 
-    fs::path inbox = getUserInbox(spool, username);
-    vector<fs::path> files = getMessageFiles(inbox);
+    vector<fs::path> files;
+    {
+        // Lockguard damit threadsicher
+        std::lock_guard<std::mutex> lock(spoolMutex);
 
-    if (msgNum < 1 || msgNum > (int)files.size()) {
+        fs::path inbox = getUserInbox(spool, username);
+        files = getMessageFiles(inbox);
+    }
+    if (msgNum < 1 || msgNum > (int)files.size())
+    {
         sendLine(sock, "ERR");
         return;
     }
 
     ifstream in(files[msgNum - 1]);
-    if (!in) {
+    if (!in)
+    {
         sendLine(sock, "ERR");
         return;
     }
@@ -201,69 +252,104 @@ void handleRead(int sock, const string& spool) {
     sendLine(sock, "OK");
 
     string line;
-    while (getline(in, line)) {
+    while (getline(in, line))
+    {
         sendLine(sock, line);
     }
 }
 
 // Handle DEL command
-void handleDelete(int sock, const string& spool) {
+void handleDelete(int sock, const string &spool)
+{
     string username = readLine(sock);
     string msgNumStr = readLine(sock);
 
-    if (!isValidUsername(username)) {
+    if (!isValidUsername(username))
+    {
         sendLine(sock, "ERR");
         return;
     }
 
     int msgNum;
-    try {
+    try
+    {
         msgNum = stoi(msgNumStr);
-    } catch (...) {
+    }
+    catch (...)
+    {
         sendLine(sock, "ERR");
         return;
     }
+    bool ok = false;
 
-    fs::path inbox = getUserInbox(spool, username);
-    vector<fs::path> files = getMessageFiles(inbox);
+    {
+        // Lockguard damit threadsicher
+        std::lock_guard<std::mutex> lock(spoolMutex);
 
-    if (msgNum < 1 || msgNum > (int)files.size()) {
-        sendLine(sock, "ERR");
-        return;
+        fs::path inbox = getUserInbox(spool, username);
+        vector<fs::path> files = getMessageFiles(inbox);
+
+        if (msgNum >= 1 && msgNum <= (int)files.size())
+        {
+            error_code ec;
+            if (fs::remove(files[msgNum - 1], ec))
+            {
+                ok = true;
+            }
+        }
     }
 
-    error_code ec;
-    if (fs::remove(files[msgNum - 1], ec)) {
+    if (ok)
+    {
         sendLine(sock, "OK");
-    } else {
+    }
+    else
+    {
         sendLine(sock, "ERR");
     }
 }
 
-static void handleClient(int c, string spool) {
-    try {
-        while (true) {
+static void handleClient(int c, string spool)
+{
+    try
+    {
+        while (true)
+        {
             string command = readLine(c);
 
-            if (command.empty()) break;
+            if (command.empty())
+                break;
 
             transform(command.begin(), command.end(), command.begin(), ::toupper);
 
-            if (command == "SEND") {
+            if (command == "SEND")
+            {
                 handleSend(c, spool);
-            } else if (command == "LIST") {
+            }
+            else if (command == "LIST")
+            {
                 handleList(c, spool);
-            } else if (command == "READ") {
+            }
+            else if (command == "READ")
+            {
                 handleRead(c, spool);
-            } else if (command == "DEL") {
+            }
+            else if (command == "DEL")
+            {
                 handleDelete(c, spool);
-            } else if (command == "QUIT") {
+            }
+            else if (command == "QUIT")
+            {
                 break;
-            } else {
+            }
+            else
+            {
                 sendLine(c, "ERR");
             }
         }
-    } catch (...) {
+    }
+    catch (...)
+    {
         // Handle any exceptions
     }
 
