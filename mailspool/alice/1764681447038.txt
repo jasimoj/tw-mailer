@@ -1,0 +1,5 @@
+Sender: if24b250
+Receiver: alice
+Subject: bob
+Message:
+was geht, hast du schon von bob gehört?.

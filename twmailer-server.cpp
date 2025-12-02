@@ -16,6 +16,10 @@
 #include <vector>
 #include <thread>
 #include <mutex>
+#include <chrono>
+#include <unordered_map>
+#include <ldap.h>
+
 using namespace std;
 namespace fs = std::filesystem;
 
@@ -25,7 +29,19 @@ static void on_sigint(int) { g_abort = 1; }
 std::mutex spoolMutex;
 std::mutex blacklistMutex;
 
-struct Session{bool authenticated = false; std::string username;};
+struct Session
+{
+    bool authenticated = false;
+    std::string username;
+};
+struct LoginInfo
+{
+    int failedAttempts = 0;
+    std::chrono::system_clock::time_point blacklistUntil{};
+};
+
+std::unordered_map<std::string, LoginInfo> LOGIN_MAP;
+std::string SPOOL_DIR;
 
 static bool checkDir(const fs::path &p)
 {
@@ -35,6 +51,73 @@ static bool checkDir(const fs::path &p)
         return fs::is_directory(p, ec);
     }
     return fs::create_directories(p, ec) || fs::is_directory(p);
+}
+
+// blacklist file
+fs::path getBlacklistFile()
+{
+    return fs::path(SPOOL_DIR) / "blacklist.txt";
+}
+
+void loadBlackList()
+
+{
+    std::lock_guard<std::mutex> lock(blacklistMutex);
+
+    LOGIN_MAP.clear();
+    fs::path file = getBlacklistFile();
+    std::ifstream in(file);
+    if (!in)
+        return;
+
+    auto now = std::chrono::system_clock::now();
+    std::string ip;
+    int fails;
+    long long until;
+
+    while (true)
+    {
+        if (!(in >> ip))
+            break;
+        if (!(in >> fails))
+            break;
+        if (!(in >> until))
+            break;
+
+        LoginInfo info;
+        info.blacklistUntil = std::chrono::system_clock::from_time_t((time_t)until);
+        info.failedAttempts = fails;
+
+        // abgelaufene Einträge überspringen
+        if (info.blacklistUntil > now)
+        {
+            LOGIN_MAP[ip] = info;
+        }
+    }
+}
+
+void saveBlacklist()
+{
+    std::lock_guard<std::mutex> lock(blacklistMutex);
+
+    fs::path file = getBlacklistFile();
+    std::ofstream out(file, std::ios::trunc);
+    if (!out)
+        return;
+
+    auto now = std::chrono::system_clock::now();
+
+    for (const auto &pair : LOGIN_MAP)
+    {
+        const std::string &ip = pair.first;
+        const LoginInfo &info = pair.second;
+
+        if (info.blacklistUntil > now)
+        {
+            time_t time = std::chrono::system_clock::to_time_t(info.blacklistUntil);
+            out << ip << " " << info.failedAttempts << " " << (long long)time << "\n";
+        }
+    }
 }
 
 // Read a line from socket
@@ -98,13 +181,12 @@ vector<fs::path> getMessageFiles(const fs::path &inbox)
 }
 
 // Handle SEND command
-void handleSend(int sock, const string &spool)
+void handleSend(int sock, const string &spool, const Session &session)
 {
-    string sender = readLine(sock);
     string receiver = readLine(sock);
     string subject = readLine(sock);
 
-    if (!isValidUsername(sender) || !isValidUsername(receiver))
+    if (!isValidUsername(receiver))
     {
         sendLine(sock, "ERR");
         return;
@@ -151,7 +233,7 @@ void handleSend(int sock, const string &spool)
             return;
         }
 
-        out << "Sender: " << sender << "\n";
+        out << "Sender: " << session.username << "\n";
         out << "Receiver: " << receiver << "\n";
         out << "Subject: " << subject << "\n";
         out << "Message:\n"
@@ -162,15 +244,9 @@ void handleSend(int sock, const string &spool)
 }
 
 // Handle LIST command
-void handleList(int sock, const string &spool)
+void handleList(int sock, const string &spool, const Session &session)
 {
-    string username = readLine(sock);
-
-    if (!isValidUsername(username))
-    {
-        sendLine(sock, "0");
-        return;
-    }
+    string username = session.username;
 
     vector<fs::path> files;
 
@@ -208,16 +284,10 @@ void handleList(int sock, const string &spool)
 }
 
 // Handle READ command
-void handleRead(int sock, const string &spool)
+void handleRead(int sock, const string &spool, const Session &session)
 {
-    string username = readLine(sock);
+    string username = session.username;
     string msgNumStr = readLine(sock);
-
-    if (!isValidUsername(username))
-    {
-        sendLine(sock, "ERR");
-        return;
-    }
 
     int msgNum;
     try
@@ -261,16 +331,10 @@ void handleRead(int sock, const string &spool)
 }
 
 // Handle DEL command
-void handleDelete(int sock, const string &spool)
+void handleDelete(int sock, const string &spool, const Session &session)
 {
-    string username = readLine(sock);
+    string username = session.username;
     string msgNumStr = readLine(sock);
-
-    if (!isValidUsername(username))
-    {
-        sendLine(sock, "ERR");
-        return;
-    }
 
     int msgNum;
     try
@@ -311,34 +375,132 @@ void handleDelete(int sock, const string &spool)
     }
 }
 
-static void handleLogin(int sock, Session &session){
-    if(session.authenticated){
-        sendLine(sock,"OK");
-        return;
-    } 
+bool ldapAuthenticate(const std::string &username, const std::string &password)
+{
 
-    string username = readLine(sock);
-    string password = readLine(sock);
+    if (password.empty())
+        return false;
 
-    if(!isValidUsername(username)){
-        sendLine(sock,"ERR");
+    LDAP *ldap = nullptr;
+    int rc;
+
+    // Verbindung aufbauen
+    rc = ldap_initialize(&ldap, "ldap://ldap.technikum-wien.at:389");
+    if (rc != LDAP_SUCCESS || !ldap)
+    {
+        cerr << "LDAP: initialize failed: " << ldap_err2string(rc) << endl;
+        return false;
+    }
+
+    int version = LDAP_VERSION3;
+    ldap_set_option(ldap, LDAP_OPT_PROTOCOL_VERSION, &version);
+
+    struct timeval tv;
+    tv.tv_sec = 5;
+    tv.tv_usec = 0;
+    ldap_set_option(ldap, LDAP_OPT_NETWORK_TIMEOUT, &tv);
+
+    std::string userDN = "uid=" + username + ",ou=people,dc=technikum-wien,dc=at";
+
+    // Bind
+    struct berval cred;
+    cred.bv_val = const_cast<char *>(password.c_str());
+    cred.bv_len = password.size();
+
+    rc = ldap_sasl_bind_s(
+        ldap,
+        userDN.c_str(),
+        LDAP_SASL_SIMPLE,
+        &cred,
+        nullptr,
+        nullptr,
+        nullptr);
+
+    if (rc != LDAP_SUCCESS)
+    {
+        std::cerr << "LDAP: bind failed for " << userDN
+                  << ": " << ldap_err2string(rc) << std::endl;
+    }
+
+    ldap_unbind_ext_s(ldap, nullptr, nullptr);
+
+    return rc == LDAP_SUCCESS;
+}
+
+static void handleLogin(int sock, Session &session, const std::string &clientIP)
+{
+    auto now = std::chrono::system_clock::now();
+    // checken ob IP in blacklist ist
+    {
+        std::lock_guard<std::mutex> lock(blacklistMutex);
+        auto it = LOGIN_MAP.find(clientIP);
+        if (it != LOGIN_MAP.end() && it->second.blacklistUntil > now)
+        {
+            // IP ist aktuell gesperrt
+            sendLine(sock, "ERR");
+            return;
+        }
+    }
+
+    if (session.authenticated)
+    {
+        sendLine(sock, "OK");
         return;
     }
 
-    bool success = (password == "test");
-    if(success){
+    string username = readLine(sock);
+    string password = readLine(sock);
+    cerr << "[SERVER] LOGIN username='" << username << "'" << endl;
+
+    if (!isValidUsername(username))
+    {
+        cerr << "[SERVER] INVALID username format" << endl;
+        sendLine(sock, "ERR");
+        return;
+    }
+
+    bool success = ldapAuthenticate(username, password);
+    cerr << "[SERVER] ldapAuthenticate returned " << (success ? "true" : "false") << endl;
+
+    if (success)
+    {
         session.authenticated = true;
         session.username = username;
+
+        {
+            std::lock_guard<std::mutex> lock(blacklistMutex);
+            auto it = LOGIN_MAP.find(clientIP);
+            if (it != LOGIN_MAP.end())
+            {
+                it->second.failedAttempts = 0;
+                it->second.blacklistUntil = std::chrono::system_clock::time_point{};
+            }
+        }
+        saveBlacklist();
         sendLine(sock, "OK");
-    } else{
+    }
+    else
+    {
+        {
+            std::lock_guard<std::mutex> lock(blacklistMutex);
+            LoginInfo &info = LOGIN_MAP[clientIP];
+            // Fehlversuche erhöhen
+            info.failedAttempts++;
+
+            if (info.failedAttempts >= 3)
+            {
+                // IP für 1 min sperren
+                info.blacklistUntil = now + std::chrono::minutes(1);
+            }
+            saveBlacklist();
+        }
         sendLine(sock, "ERR");
     }
 }
 
-static void handleClient(int c, string spool)
+static void handleClient(int c, string spool, std::string clientIP)
 {
-    Session session; //Session pro Client
-
+    Session session; // Session pro Client
     try
     {
         while (true)
@@ -349,24 +511,46 @@ static void handleClient(int c, string spool)
                 break;
 
             transform(command.begin(), command.end(), command.begin(), ::toupper);
-            if(command == "LOGIN"){
-                handleLogin(c, session);
-            }
-            if (command == "SEND")
+
+            if (command == "LOGIN")
             {
-                handleSend(c, spool);
+                handleLogin(c, session, clientIP);
+            }
+            else if (command == "SEND")
+            {
+                if (!session.authenticated)
+                {
+                    sendLine(c, "ERR");
+                    continue;
+                }
+                handleSend(c, spool, session);
             }
             else if (command == "LIST")
             {
-                handleList(c, spool);
+                if (!session.authenticated)
+                {
+                    sendLine(c, "ERR");
+                    continue;
+                }
+                handleList(c, spool, session);
             }
             else if (command == "READ")
             {
-                handleRead(c, spool);
+                if (!session.authenticated)
+                {
+                    sendLine(c, "ERR");
+                    continue;
+                }
+                handleRead(c, spool, session);
             }
             else if (command == "DEL")
             {
-                handleDelete(c, spool);
+                if (!session.authenticated)
+                {
+                    sendLine(c, "ERR");
+                    continue;
+                }
+                handleDelete(c, spool, session);
             }
             else if (command == "QUIT")
             {
@@ -406,6 +590,8 @@ int main(int argc, char *argv[])
         cerr << "Unable to open/create spool directory" << endl;
         return 1;
     }
+    SPOOL_DIR = spool;
+    loadBlackList();
 
     std::signal(SIGINT, on_sigint);
 
@@ -461,7 +647,7 @@ int main(int argc, char *argv[])
         inet_ntop(AF_INET, &client.sin_addr, clientIP, INET_ADDRSTRLEN);
         cout << "Client connected: " << clientIP << ":" << ntohs(client.sin_port) << endl;
 
-        thread{handleClient, c, spool}.detach();
+        thread{handleClient, c, spool, std::string(clientIP)}.detach();
     }
 
     cout << "\nShutting down server..." << endl;
