@@ -25,6 +25,8 @@ static void on_sigint(int) { g_abort = 1; }
 std::mutex spoolMutex;
 std::mutex blacklistMutex;
 
+struct Session{bool authenticated = false; std::string username;};
+
 static bool checkDir(const fs::path &p)
 {
     error_code ec;
@@ -309,8 +311,34 @@ void handleDelete(int sock, const string &spool)
     }
 }
 
+static void handleLogin(int sock, Session &session){
+    if(session.authenticated){
+        sendLine(sock,"OK");
+        return;
+    } 
+
+    string username = readLine(sock);
+    string password = readLine(sock);
+
+    if(!isValidUsername(username)){
+        sendLine(sock,"ERR");
+        return;
+    }
+
+    bool success = (password == "test");
+    if(success){
+        session.authenticated = true;
+        session.username = username;
+        sendLine(sock, "OK");
+    } else{
+        sendLine(sock, "ERR");
+    }
+}
+
 static void handleClient(int c, string spool)
 {
+    Session session; //Session pro Client
+
     try
     {
         while (true)
@@ -321,7 +349,9 @@ static void handleClient(int c, string spool)
                 break;
 
             transform(command.begin(), command.end(), command.begin(), ::toupper);
-
+            if(command == "LOGIN"){
+                handleLogin(c, session);
+            }
             if (command == "SEND")
             {
                 handleSend(c, spool);
