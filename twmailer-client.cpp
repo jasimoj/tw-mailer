@@ -140,7 +140,7 @@ void handleRead(int sock)
         while (true)
         {
             line = readLine(sock);
-            if (line.empty() && recv(sock, nullptr, 0, MSG_PEEK) <= 0)
+            if (line == ".")
                 break;
             cout << line << endl;
         }

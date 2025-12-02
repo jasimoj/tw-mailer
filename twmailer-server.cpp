@@ -328,6 +328,7 @@ void handleRead(int sock, const string &spool, const Session &session)
     {
         sendLine(sock, line);
     }
+    sendLine(sock, ".");
 }
 
 // Handle DEL command
