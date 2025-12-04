@@ -26,21 +26,25 @@ namespace fs = std::filesystem;
 static volatile sig_atomic_t g_abort = 0;
 static void on_sigint(int) { g_abort = 1; }
 
+// Mutexes
 std::mutex spoolMutex;
 std::mutex blacklistMutex;
 
+// Session info
 struct Session
 {
     bool authenticated = false;
     std::string username;
 };
+
+// Infos zu Login versuchen von einer IP Adresse
 struct LoginInfo
 {
     int failedAttempts = 0;
-    std::chrono::system_clock::time_point blacklistUntil{};
+    std::chrono::system_clock::time_point blacklistUntil{}; // Zeitpunkt an dem IP gesperrt wurde
 };
 
-std::unordered_map<std::string, LoginInfo> LOGIN_MAP;
+std::unordered_map<std::string, LoginInfo> LOGIN_MAP; // Map fürs Blacklisting
 std::string SPOOL_DIR;
 
 static bool checkDir(const fs::path &p)
@@ -59,6 +63,8 @@ fs::path getBlacklistFile()
     return fs::path(SPOOL_DIR) / "blacklist.txt";
 }
 
+// Lädt die Blacklist aus der Datei in LOGIN_MAP
+// Alte einträge werden verworfen
 void loadBlackList()
 
 {
@@ -88,7 +94,7 @@ void loadBlackList()
         info.blacklistUntil = std::chrono::system_clock::from_time_t((time_t)until);
         info.failedAttempts = fails;
 
-        // abgelaufene Einträge überspringen
+        // abgelaufene Einträge überspringen und nur die nehmen die noch gültig sind
         if (info.blacklistUntil > now)
         {
             LOGIN_MAP[ip] = info;
@@ -96,6 +102,7 @@ void loadBlackList()
     }
 }
 
+// schreibt alle aktuell aktiven Blacklist einträge in die blacklist.txt
 void saveBlacklist()
 {
     std::lock_guard<std::mutex> lock(blacklistMutex);
@@ -120,7 +127,7 @@ void saveBlacklist()
     }
 }
 
-// Read a line from socket
+// Read a line from socket till "\n"
 string readLine(int sock)
 {
     string line;
@@ -209,7 +216,7 @@ void handleSend(int sock, const string &spool, const Session &session)
         message += line + "\n";
     }
     {
-        // Lockguard damit threadsicher
+        // mutex damit threadsicher
         std::lock_guard<std::mutex> lock(spoolMutex);
 
         // Create receiver's inbox
@@ -376,6 +383,8 @@ void handleDelete(int sock, const string &spool, const Session &session)
     }
 }
 
+// Authentifiziert User fürs FH LdAP
+// DN: uid=<username>,ou=people,dc=technikum-wien,dc=at
 bool ldapAuthenticate(const std::string &username, const std::string &password)
 {
 
@@ -396,18 +405,21 @@ bool ldapAuthenticate(const std::string &username, const std::string &password)
     int version = LDAP_VERSION3;
     ldap_set_option(ldap, LDAP_OPT_PROTOCOL_VERSION, &version);
 
+    // Netzwerktimeout setzen damit wir nich thängen bleiben
     struct timeval tv;
     tv.tv_sec = 5;
     tv.tv_usec = 0;
     ldap_set_option(ldap, LDAP_OPT_NETWORK_TIMEOUT, &tv);
 
+    // DN
     std::string userDN = "uid=" + username + ",ou=people,dc=technikum-wien,dc=at";
 
-    // Bind
+    // Credentials vorbereiten
     struct berval cred;
     cred.bv_val = const_cast<char *>(password.c_str());
     cred.bv_len = password.size();
 
+    // Simple bind
     rc = ldap_sasl_bind_s(
         ldap,
         userDN.c_str(),
@@ -423,6 +435,7 @@ bool ldapAuthenticate(const std::string &username, const std::string &password)
                   << ": " << ldap_err2string(rc) << std::endl;
     }
 
+    // Verbindung schließen
     ldap_unbind_ext_s(ldap, nullptr, nullptr);
 
     return rc == LDAP_SUCCESS;
@@ -439,6 +452,8 @@ static void handleLogin(int sock, Session &session, const std::string &clientIP)
         {
             // IP ist aktuell gesperrt
             sendLine(sock, "ERR");
+            cerr << "[SERVER] USER is blacklisted" << endl;
+
             return;
         }
     }
@@ -449,6 +464,7 @@ static void handleLogin(int sock, Session &session, const std::string &clientIP)
         return;
     }
 
+    // Login daten vom client lesen
     string username = readLine(sock);
     string password = readLine(sock);
     cerr << "[SERVER] LOGIN username='" << username << "'" << endl;
@@ -465,6 +481,7 @@ static void handleLogin(int sock, Session &session, const std::string &clientIP)
 
     if (success)
     {
+        // Session befüllen
         session.authenticated = true;
         session.username = username;
 
@@ -482,10 +499,10 @@ static void handleLogin(int sock, Session &session, const std::string &clientIP)
     }
     else
     {
+        // Fehlversuche erhöhen
         {
             std::lock_guard<std::mutex> lock(blacklistMutex);
             LoginInfo &info = LOGIN_MAP[clientIP];
-            // Fehlversuche erhöhen
             info.failedAttempts++;
 
             if (info.failedAttempts >= 3)
@@ -493,8 +510,9 @@ static void handleLogin(int sock, Session &session, const std::string &clientIP)
                 // IP für 1 min sperren
                 info.blacklistUntil = now + std::chrono::minutes(1);
             }
-            saveBlacklist();
         }
+        saveBlacklist();
+
         sendLine(sock, "ERR");
     }
 }
@@ -648,6 +666,7 @@ int main(int argc, char *argv[])
         inet_ntop(AF_INET, &client.sin_addr, clientIP, INET_ADDRSTRLEN);
         cout << "Client connected: " << clientIP << ":" << ntohs(client.sin_port) << endl;
 
+        // Pro CLient wird ein Thread erstellt
         thread{handleClient, c, spool, std::string(clientIP)}.detach();
     }
 

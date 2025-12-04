@@ -56,7 +56,7 @@ void handleSend(int sock)
     while (true)
     {
         getline(cin, line);
-        if (line == ".")
+        if (line == ".") // beendet die Nachricht
             break;
         message += line + "\n";
     }
@@ -106,6 +106,7 @@ void handleList(int sock)
     else
     {
         cout << "Messages (" << count << "):" << endl;
+        // Jede Betreffszeile lesen
         for (int i = 0; i < count; i++)
         {
             string subject = readLine(sock);
@@ -141,6 +142,8 @@ void handleRead(int sock)
         {
             line = readLine(sock);
             if (line == ".")
+                break;
+            if (line.empty() && recv(sock, nullptr, 0, MSG_PEEK) <= 0)
                 break;
             cout << line << endl;
         }
@@ -200,6 +203,11 @@ bool handleLogin(int sock)
     }
 
     string response = readLine(sock);
+    if (response.empty())
+    {
+        cerr << "Server closed connection during LOGIN" << endl;
+        return false;
+    }
     if (response == "OK")
     {
         cout << "Login was successfull!" << endl;
@@ -229,7 +237,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // Create socket
+    // Create TCP socket
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock == -1)
     {
@@ -270,13 +278,21 @@ int main(int argc, char *argv[])
 
         // Convert to uppercase
         transform(command.begin(), command.end(), command.begin(), ::toupper);
+        
         if (command == "LOGIN")
         {
-            loggedIn = handleLogin(sock);
+            bool result = handleLogin(sock);
+
+            if (result)
+            {
+                loggedIn = true;
+            }
+            continue;
         }
         else if (command == "SEND")
         {
-            if(!loggedIn){
+            if (!loggedIn)
+            {
                 cout << "Please LOGIN first" << endl;
                 continue;
             }
@@ -284,7 +300,8 @@ int main(int argc, char *argv[])
         }
         else if (command == "LIST")
         {
-            if(!loggedIn){
+            if (!loggedIn)
+            {
                 cout << "Please LOGIN first" << endl;
                 continue;
             }
@@ -292,7 +309,8 @@ int main(int argc, char *argv[])
         }
         else if (command == "READ")
         {
-            if(!loggedIn){
+            if (!loggedIn)
+            {
                 cout << "Please LOGIN first" << endl;
                 continue;
             }
@@ -300,7 +318,8 @@ int main(int argc, char *argv[])
         }
         else if (command == "DEL")
         {
-            if(!loggedIn){
+            if (!loggedIn)
+            {
                 cout << "Please LOGIN first" << endl;
                 continue;
             }
